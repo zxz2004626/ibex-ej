@@ -49,35 +49,44 @@ build sim_bp   +define+BP_ENABLE     # BranchPredictor = 1  (maxperf)
 build sim_nobp                       # BranchPredictor = 0
 
 # ------------------------------------------------------------- program image
-riscv64-unknown-elf-gcc -march=rv32im -mabi=ilp32 -nostdlib -nostartfiles \
-    -T link.ld -o prog_u.elf prog_u.S
-riscv64-unknown-elf-objcopy -O binary prog_u.elf prog_u.bin
-python3 gen_hex.py prog_u.bin prog_u.hex 0x80 >/dev/null
+for p in prog_u prog_u_ecall; do
+  riscv64-unknown-elf-gcc -march=rv32im -mabi=ilp32 -nostdlib -nostartfiles \
+      -T link.ld -o $p.elf $p.S
+  riscv64-unknown-elf-objcopy -O binary $p.elf $p.bin
+  python3 gen_hex.py $p.bin $p.hex 0x80 >/dev/null
+done
 
 FAULT_HEX=$(riscv64-unknown-elf-nm prog_u.elf | awk '$3=="fault"{print $1}')
 FAULT=$((16#$FAULT_HEX))
 echo "== the fault is injected once, on the fetch of 'fault' @ 0x$FAULT_HEX ($FAULT) =="
 
-run() { # $1 = sim, $2 = tag, $3 = fault arg, $4.. = extra
-  local sim=$1 tag=$2
-  shift 2
+run() { # $1 = sim, $2 = tag, $3 = program image, $4.. = extra
+  local sim=$1 tag=$2 prog=$3
+  shift 3
   local w=""
   [ $WAVE = 1 ] && w="+wave=waves/$tag.fsdb"
-  ./$sim +mem=prog_u.hex +dump=dump_$tag.txt +trace=1 $w "$@" \
+  ./$sim +mem=$prog +dump=dump_$tag.txt +trace=1 $w "$@" \
        > run_$tag.log 2>&1 || true
   printf '\n----- %s -----\n' "$tag"
   grep -E "^FAULT |^RVFI|^DONE|^TIMEOUT" run_$tag.log | head -40
   [ -f dump_$tag.txt ] && cat dump_$tag.txt
 }
 
-run sim_bp   esc     +fault_addr=$FAULT
-run sim_nobp ok      +fault_addr=$FAULT
-run sim_bp   nofault
+echo "===== A) external fault injection on instr_err_i ====="
+run sim_bp   esc     prog_u.hex       +fault_addr=$FAULT
+run sim_nobp ok      prog_u.hex       +fault_addr=$FAULT
+run sim_bp   nofault prog_u.hex
+
+echo
+echo "===== B) no fault injection at all, just an ecall (a syscall) ====="
+run sim_bp   uecall_esc prog_u_ecall.hex
+run sim_nobp uecall_ok  prog_u_ecall.hex
 
 echo
 echo "== summary =="
-printf '  BranchPredictor=1 + fault : %s\n' "$(grep -m1 '^DONE' run_esc.log || echo 'no completion')"
-printf '  BranchPredictor=0 + fault : %s\n' "$(grep -m1 '^DONE' run_ok.log  || echo 'no completion')"
+for t in esc ok nofault uecall_esc uecall_ok; do
+  printf '  %-12s %s\n' "$t" "$(cat dump_$t.txt 2>/dev/null | tr '\n' ' ' || echo 'no completion')"
+done
 echo
 echo "  expect: BP=1 -> handler skipped (R_HAN untouched) and the U-mode code"
 echo "          reads mtvec with M privilege (R_ESC = 00000101)."

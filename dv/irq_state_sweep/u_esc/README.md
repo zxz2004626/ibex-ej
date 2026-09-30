@@ -35,8 +35,18 @@ leave `halt_if` deasserted and therefore do clear the skid.
 
 ## Affected configuration
 
-* `BranchPredictor = 1` (the `maxperf` configuration in `ibex_configs.yaml`; the
-  default is 0, and the parameter is marked *experimental*)
+* `BranchPredictor = 1`. This is **not** a default and **not** one of the
+  supported configurations: in `ibex_configs.yaml` every supported entry
+  (`small`, `opentitan`, `maxperf`, `maxperf-pmp*`) sets `BranchPredictor: 0`.
+  The only entry that enables it is `experimental-branch-predictor`, listed under
+  "EXPERIMENTAL CONFIGURATIONS - configurations using experimental features that
+  aren't yet verified and/or known to have issues". The `maxperf` entry is
+  explicitly "the maximum performance configuration *ignoring* the branch
+  predictor (which isn't yet fully verified)".
+
+  So this is a latent defect in an experimental, non-default configuration
+  rather than a vulnerability in any supported build - but it must be fixed
+  before the branch predictor can be considered production-ready.
 * Verified on upstream `master` at `4dd3932a`.
 
 ## Root cause
@@ -99,11 +109,14 @@ assign skid_valid_d =
 u_esc/
   repro.sh            builds both configurations and runs all three cases
   tb_ibex_esc.sv      VCS testbench (simple memory + one-shot instr_err_i injection)
-  prog_u.S            the PoC program
+  prog_u.S            PoC A: external one-shot `instr_err_i` fault injection
+  prog_u_ecall.S      PoC B: no fault injection at all - just an `ecall`
   link.ld gen_hex.py  build helpers (reset vector 0x80, 256-byte aligned .vec)
   skid_fix.patch      proposed one-line fix
-  waves/u_esc.fsdb    waveform, BranchPredictor=1 (vulnerable)
-  waves/u_ok.fsdb     waveform, BranchPredictor=0 (correct)
+  waves/u_esc.fsdb      waveform, PoC A, BranchPredictor=1 (vulnerable)
+  waves/u_ok.fsdb       waveform, PoC A, BranchPredictor=0 (correct)
+  waves/u_ecall_esc.fsdb  waveform, PoC B, BranchPredictor=1 (vulnerable)
+  waves/u_ecall_ok.fsdb   waveform, PoC B, BranchPredictor=0 (correct)
 ```
 
 ```sh
@@ -126,10 +139,30 @@ predictor predicts it taken.
 ## Observed results
 
 ```
-BranchPredictor=1 + fault : DONE cycles=34  R_HAN=00000013 R_ESC=00000101   <- escalated
-BranchPredictor=0 + fault : DONE cycles=51  R_HAN=00000001 R_ESC=00000000   <- correct
-BranchPredictor=1, no fault: DONE cycles=42 R_HAN=00000001 R_ESC=00000000   <- control
+PoC A (one-shot instr_err_i fault)
+  BranchPredictor=1 + fault : R_HAN=00000013 R_ESC=00000101   <- escalated
+  BranchPredictor=0 + fault : R_HAN=00000001 R_ESC=00000000   <- correct
+  BranchPredictor=1, no fault: R_HAN=00000001 R_ESC=00000000  <- control
+
+PoC B (plain `ecall`, NO fault injection; repro.sh section B)
+  BranchPredictor=1         : R_HAN=00000013 R_ESC=00000101   <- escalated
+  BranchPredictor=0         : R_HAN=00000001 R_ESC=00000000   <- correct
 ```
+
+PoC B differs from A only in what triggers the trap. `prog_u_ecall.S` runs in
+U-mode and executes an ordinary `ecall`; in the vulnerable build the trap handler
+is skipped and the `blt` back-edge, stranded in the skid buffer, is executed in
+M-mode:
+
+```
+RVFI 14 cyc=26 pc=000000b8 insn=00000073 trap=1 | priv=3 mcause=11  <- U-mode ecall, priv raised
+RVFI 15 cyc=29 pc=000000bc insn=ff24cce3 trap=0 | priv=3 mcause=11  <- the STALE blt
+RVFI 17 cyc=32 pc=000000c4 insn=305023f3 trap=0 | priv=3           <- csrr t2,mtvec SUCCEEDS
+```
+
+(`li t2, 0` sits between the branch and the probe so that the correct path,
+where the U-mode `csrr` traps and the handler skips it, still leaves
+`R_ESC = 0` rather than a stale register value.)
 
 * `R_HAN` (0x600) is written by the M-mode trap handler. `00000013` is the
   memory fill pattern - i.e. the handler never ran.
@@ -183,6 +216,33 @@ broken.
 With the patch applied, all three cases in `repro.sh` produce `R_HAN=00000001`,
 `R_ESC=00000000`, and no regression was observed in the mult/div interrupt
 sweeps in the parent directory.
+
+## Reachability without any fault injection
+
+`instr_err_i` is not a special "attacker only" signal. In `ibex_if_stage.sv:430`
+it is OR'd with the PMP and CHERIoT checks to form the single
+`instr_fetch_err` that reaches the controller:
+
+```systemverilog
+assign if_instr_err = if_instr_bus_err | if_instr_pmp_err | cheriot_acc_vio | cheriot_bound_vio;
+```
+
+So the very same `FLUSH` window is reachable from entirely ordinary
+architecture:
+
+* **PMP instruction-access fault** - a U-mode program jumping outside its
+  executable region. This is precisely the violation a U-mode sandbox exists to
+  contain, and it needs no fault injection at all.
+* **CHERIoT fetch violation** (`cheriot_acc_vio` / `cheriot_bound_vio`) - a
+  capability whose bounds or permissions do not cover the fetch target.
+* A memory/interconnect error response, or an ECC error on a fetched word -
+  the error the ECC machinery is *designed* to trap on.
+
+More generally the bug does not need `instr_err` at all: the same skid window is
+entered by every path through the controller's `FLUSH` state. It has been
+reproduced with an ordinary `ecall` (mcause 11) and with an ordinary `mret`, both
+of which are plain instructions requiring no fault injection. The `instr_err`
+variant exists only because it makes the trigger unambiguously external.
 
 ## Notes on the threat model
 
