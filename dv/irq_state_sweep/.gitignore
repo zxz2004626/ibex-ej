@@ -1,0 +1,48 @@
+# build / simulator artifacts
+simv
+simv_bp
+simv_single
+simv_slow
+csrc/
+*.daidir/
+verdiLog/
+novas*
+ucli.key
+vc_hdrs.h
+
+# generated program images
+prog.elf
+prog.bin
+prog.hex
+prog_bp.elf
+prog_bp.bin
+prog_bp.hex
+prog_bp2.elf
+prog_bp2.bin
+prog_bp2.hex
+prog_bp3.elf
+prog_bp3.bin
+prog_bp3.hex
+
+# generated filelists / logs / dumps
+filelist.f
+*.log
+*.vpd
+dump*.txt
+b0.txt
+b1.txt
+b2.txt
+b3.txt
+h.txt
+i30.txt
+t.txt
+golden.txt
+golden_slow.txt
+s_*.txt
+z_*.txt
+d_*.txt
+chk_*.txt
+
+# waveforms ARE kept on purpose (waves/*.fsdb)
+!waves/
+!waves/*.fsdb

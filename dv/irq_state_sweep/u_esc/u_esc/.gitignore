@@ -1,0 +1,16 @@
+sim_bp
+sim_nobp
+csrc/
+*.daidir/
+*.log
+*.fsdb
+prog_u.elf
+prog_u.bin
+prog_u.hex
+dump_*.txt
+verdiLog/
+novas*
+filelist.f
+!waves/*.fsdb
+ucli.key
+vc_hdrs.h
