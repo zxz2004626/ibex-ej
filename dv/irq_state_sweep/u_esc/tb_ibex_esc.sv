@@ -185,6 +185,18 @@ module tb_ibex_esc;
 
   // --------------------------------------------------------------- tracing
   int unsigned cycle_cnt = 0;
+
+  // Reproducible skid / controller timeline (only exists with the predictor).
+  logic timeline_on = 1'b0;
+`ifdef BP_ENABLE
+  wire        tl_skid_v    = dut.u_ibex_core.if_stage_i.g_branch_predictor.instr_skid_valid_q;
+  wire [31:0] tl_skid_addr = dut.u_ibex_core.if_stage_i.g_branch_predictor.instr_skid_addr_q;
+  wire [3:0]  tl_ctrl      = dut.u_ibex_core.id_stage_i.controller_i.ctrl_fsm_cs;
+  always @(posedge clk) if (rst_n && timeline_on)
+    $display("CYC %0d ctrl=%0d skid_valid=%b skid_addr=%08x id_pc=%08x id_valid=%b",
+             cycle_cnt, tl_ctrl, tl_skid_v, tl_skid_addr,
+             dut.u_ibex_core.id_stage_i.pc_id_i, dut.u_ibex_core.id_stage_i.instr_valid_i);
+`endif
   int unsigned trace_n   = 0;
   logic        trace_on  = 1'b0;
   string       dump_file = "dump.txt";
@@ -212,6 +224,7 @@ module tb_ibex_esc;
     if (!$value$plusargs("dump=%s",  dump_file)) dump_file = "dump.txt";
     void'($value$plusargs("fault_addr=%d", fault_addr));
     void'($value$plusargs("trace=%d",      trace_on));
+    void'($value$plusargs("timeline=%d",   timeline_on));
     if (!$value$plusargs("wave=%s",  wave_file)) wave_file = "";
 
     for (int i = 0; i < MEM_WORDS; i++) mem[i] = 32'h00000013;   // NOP fill

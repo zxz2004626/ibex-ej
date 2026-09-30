@@ -1,57 +1,55 @@
-# U-mode privilege escalation from a single top-level instruction-bus error (`BranchPredictor=1`)
+# One Branch Away from M-mode: U-mode privilege escalation in Ibex
 
-## Summary
+A U-mode program that takes a trap while a predicted-taken branch is stranded in
+the IF-stage branch-predictor skid buffer keeps executing **with M-mode
+privilege**. The trap handler - the code that is supposed to enforce the U/M
+boundary - never runs.
 
-When Ibex is built with `BranchPredictor=1`, the IF-stage branch-predictor skid
-buffer is not invalidated when the pipeline is flushed by a trap. If a
-predicted-taken branch happens to be sitting in the skid buffer when an
-exception is taken, that stale branch survives the redirect and is executed as
-the first post-trap instruction.
-
-Because trap entry is what raises the privilege level, the consequence from
-U-mode is not just "the handler is skipped" - the core is now in M-mode and the
-PC is steered back into the U-mode instruction stream, so **U-mode code keeps
-executing with M-mode privilege**.
-
-Only one external port is perturbed to trigger this: a single transient error
-response on the top-level `instr_err_i` (an instruction access fault). No
-software cooperation and no forcing of internal signals is required.
-
-## Impact
-
-A sandboxed U-mode program that takes one transient instruction-bus fault
-executes past the trap handler with M-mode privilege. It can then read/write
-M-mode-only CSRs (`mtvec`, `pmpcfg*`, ...), reprogram PMP, or otherwise escape
-the U-mode sandbox completely. The trap is silently swallowed - the handler that
-would have enforced the policy never runs.
-
-Note this is *not* limited to `instr_err_i`: anything that reaches the
-controller's `FLUSH` state is exposed - all synchronous exceptions (illegal
-instruction, `ecall`, `ebreak`, instruction fetch error, load/store misaligned
-or access fault, CHERIoT faults) plus `mret`, `dret`, `wfi` and CSR-write
-triggered flushes. External interrupts (`irq_*`) and debug entry are **not**
-affected, because they are taken through `IRQ_TAKEN` / `DBG_TAKEN_IF`, which
-leave `halt_if` deasserted and therefore do clear the skid.
+The trigger is ordinary software. No fault injection, no attacker-controlled
+pins, no hardware glitch: an `ecall` (a syscall any U-mode program may issue)
+immediately followed by a loop back-edge is enough.
 
 ## Affected configuration
 
-* `BranchPredictor = 1`. This is **not** a default and **not** one of the
-  supported configurations: in `ibex_configs.yaml` every supported entry
-  (`small`, `opentitan`, `maxperf`, `maxperf-pmp*`) sets `BranchPredictor: 0`.
-  The only entry that enables it is `experimental-branch-predictor`, listed under
-  "EXPERIMENTAL CONFIGURATIONS - configurations using experimental features that
-  aren't yet verified and/or known to have issues". The `maxperf` entry is
-  explicitly "the maximum performance configuration *ignoring* the branch
-  predictor (which isn't yet fully verified)".
+* Requires `BranchPredictor = 1`.
+* This is **not** a default and **not** a supported configuration. In
+  `ibex_configs.yaml` every supported entry - `small`, `opentitan`, `maxperf`,
+  `maxperf-pmp*` - sets `BranchPredictor: 0`. The only entry that enables it is
+  `experimental-branch-predictor`, listed under
+  *"EXPERIMENTAL CONFIGURATIONS - configurations using experimental features
+  that aren't yet verified and/or known to have issues"*. The `maxperf` entry is
+  explicitly described as the maximum performance configuration *"ignoring the
+  branch predictor (which isn't yet fully verified)"*.
 
-  So this is a latent defect in an experimental, non-default configuration
-  rather than a vulnerability in any supported build - but it must be fixed
-  before the branch predictor can be considered production-ready.
-* Verified on upstream `master` at `4dd3932a`.
+So no supported Ibex build is affected. This is a latent defect in an
+experimental configuration that must be fixed before the branch predictor can be
+considered production-ready - and any integration that has enabled the
+predictor is fully exposed.
+
+* Verified against upstream `master` at `4dd3932a`.
+
+## Impact
+
+Trap entry is what raises the privilege level, and trap entry does happen:
+`mepc`, `mcause` and `mstatus` are all updated, `mstatus.MPP` records U, and the
+core is now in M-mode. But the PC is then steered back into the U-mode
+instruction stream by the stranded branch, so the sandboxed program continues
+running with M-mode privilege.
+
+It can then read and write M-mode-only CSRs (`mtvec`, `pmpcfg*`, `mepc`, ...),
+disable PMP, redirect the trap vector, or otherwise take complete control of the
+core. The trap is silently swallowed and whatever policy the handler would have
+enforced never happens.
+
+This is a design defect rather than a transient fault, so redundancy does not
+help: a lockstep shadow core contains the same bug and produces identical
+outputs, so the lockstep output comparison never fires. (In a `SecureIbex=1`
+build the independent `PCIncrCheck` hardening does notice the anomalous PC and
+raises `alert_major_internal` - but only *after* the trap has been skipped.)
 
 ## Root cause
 
-`rtl/ibex_if_stage.sv:731` (inside `generate if (BranchPredictor) : g_branch_predictor`):
+`rtl/ibex_if_stage.sv:731`, inside `generate if (BranchPredictor) : g_branch_predictor`:
 
 ```systemverilog
 assign instr_skid_valid_d = (instr_skid_valid_q & ~id_in_ready_i & ~stall_dummy_instr &
@@ -69,30 +67,33 @@ but an *already occupied* skid is never cleared.
 assign id_in_ready_o = ~stall & ~halt_if & ~retain_id;
 ```
 
-* `FLUSH` (used for exceptions, `mret`, `dret`, `wfi`, CSR-write flushes)
-  asserts `halt_if`, so `id_in_ready_o == 0` and the skid survives the redirect.
-* `IRQ_TAKEN` and `DBG_TAKEN_IF` leave `halt_if` deasserted and also assert
-  `pc_set_o`, so `id_in_ready_o == 1` while `if_id_pipe_reg_we` is masked by
-  `~pc_set_i` - the skid is cleared without being consumed. That is why only the
-  `FLUSH` path is affected.
+* `FLUSH` - taken for every synchronous exception, and also for `mret`, `dret`,
+  `wfi` and CSR-write flushes - asserts `halt_if`, so `id_in_ready_o == 0` and
+  the skid survives the redirect.
+* `IRQ_TAKEN` and `DBG_TAKEN_IF` leave `halt_if` deasserted and additionally
+  assert `pc_set_o`, so `id_in_ready_o == 1` while `if_id_pipe_reg_we` is masked
+  by `~pc_set_i`: the skid is cleared without being consumed. **External
+  interrupts and debug requests are therefore not affected** - only the `FLUSH`
+  path is.
 
-Timeline for the reproducer below (cycles are simulation cycles):
+Concretely, for the PoC below:
 
 ```
-cyc 14  ctrl=FLUSH   instr_skid_valid_q=1  instr_skid_addr_q=0x000000a0   <- branch stranded
-cyc 15  ctrl=DECODE  instr_skid_valid_q=1
-cyc 16  ctrl=DECODE  instr_skid_valid_q=0  pc_id=0x000000a0 valid=1       <- stale insn latched
+CYC 24  ctrl=5 (DECODE)  skid_valid=0  id_pc=0xb8 id_valid=1   <- the ecall is in ID
+CYC 25  ctrl=6 (FLUSH)   skid_valid=1  skid_addr=0xbc          <- the back-edge is stranded
+CYC 26  ctrl=5 (DECODE)  skid_valid=1
+CYC 27  ctrl=5 (DECODE)  skid_valid=0  id_pc=0xbc id_valid=1   <- stale insn latched into ID
 ```
 
-At cyc 16 `id_in_ready_o == 1` and `pc_set_i == 0`, so
+At CYC 27 `id_in_ready_o == 1` and `pc_set_i == 0`, so
 `if_id_pipe_reg_we = if_instr_valid & id_in_ready_i & ~pc_set_i`
 (`ibex_if_stage.sv:587`) is high and the stale branch is written into the IF/ID
 register.
 
-If that stale branch turns out **not** to be taken (a static-predictor
-misprediction), `nt_branch_mispredict_o` steers the PC to the branch's own
-fall-through (`predicted_branch_nt_pc_q`, `ibex_if_stage.sv:897`), which is back
-in the pre-trap instruction stream - so the trap vector is abandoned entirely.
+The branch is predicted-taken but actually **not** taken, so
+`nt_branch_mispredict_o` steers the PC to the branch's own fall-through
+(`predicted_branch_nt_pc_q`, `ibex_if_stage.sv:897`) - straight back into the
+pre-trap instruction stream - and the trap vector is abandoned.
 
 The same state element is what the instruction cache already guards against for
 its own skid (`rtl/ibex_icache.sv:1105`):
@@ -107,86 +108,86 @@ assign skid_valid_d =
 
 ```
 u_esc/
-  repro.sh            builds both configurations and runs all three cases
-  tb_ibex_esc.sv      VCS testbench (simple memory + one-shot instr_err_i injection)
-  prog_u.S            PoC A: external one-shot `instr_err_i` fault injection
-  prog_u_ecall.S      PoC B: no fault injection at all - just an `ecall`
-  link.ld gen_hex.py  build helpers (reset vector 0x80, 256-byte aligned .vec)
-  skid_fix.patch      proposed one-line fix
-  waves/u_esc.fsdb      waveform, PoC A, BranchPredictor=1 (vulnerable)
-  waves/u_ok.fsdb       waveform, PoC A, BranchPredictor=0 (correct)
-  waves/u_ecall_esc.fsdb  waveform, PoC B, BranchPredictor=1 (vulnerable)
-  waves/u_ecall_ok.fsdb   waveform, PoC B, BranchPredictor=0 (correct)
+  repro.sh                builds both configurations and runs all cases
+  tb_ibex_esc.sv          VCS testbench (simple memory, RVFI trace, timeline probe)
+  prog_u_ecall.S          PoC: software only - an ordinary `ecall`
+  prog_u.S                same window via one external `instr_err_i` error response
+  link.ld gen_hex.py      build helpers (reset vector 0x80, 256-byte aligned .vec)
+  skid_fix.patch          proposed one-line fix
+  waves/u_ecall_esc.fsdb  waveform, BranchPredictor=1 (vulnerable)
+  waves/u_ecall_ok.fsdb   waveform, BranchPredictor=0 (correct)
+  waves/u_esc.fsdb        waveform, external-trigger variant, BranchPredictor=1
+  waves/u_ok.fsdb         waveform, external-trigger variant, BranchPredictor=0
 ```
 
 ```sh
 cd u_esc && ./repro.sh          # add -w to regenerate the FSDB waveforms
+
+# just the software-only PoC:
+./sim_bp   +mem=prog_u_ecall.hex +trace=1 +timeline=1
+./sim_nobp +mem=prog_u_ecall.hex +trace=1
 ```
 
-The program drops to U-mode via `mret` (`mstatus.MPP = 0`), then executes:
+### The PoC
+
+`prog_u_ecall.S` drops to U-mode via `mret` (`mstatus.MPP = 0`) and then runs:
 
 ```asm
-fault:
-  nop                     // <- a single instr_err_i error response lands here
-  blt   s1, s2, back      // backward => predicted TAKEN, but 9 < 5 is false
-  csrr  t2, mtvec         // M-mode-only CSR: illegal in U-mode
-  sw    t2, R_ESC(x0)     // executes only if we are actually in M-mode
+back:
+  addi  s0, s0, 1
+
+Injection:
+  ecall                    // the IF stage holds the blt below while this is in ID
+  blt   s1, s2, back       // backward -> predicted TAKEN, but 9 < 5 is false
+
+  // Reached only if the trap handler was skipped, i.e. we are still in M-mode.
+  li    t2, 0
+  csrr  t2, mtvec          // M-mode-only CSR: illegal in U-mode
+  sw    t2, R_ESC(x0)
+  li    t6, 0xDEADBEEF
+  sw    t6, R_DONE(x0)
 ```
 
-`back` is placed before `fault` so the branch offset is negative and the static
-predictor predicts it taken.
+`ecall` is an ordinary syscall, and a loop back-edge is the most common
+control-flow shape there is. The `li t2, 0` keeps the discriminator clean: on
+the correct path the U-mode `csrr` raises an illegal instruction, the handler
+skips it, and `sw t2, R_ESC` still executes in U-mode - but now carries `t2 == 0`,
+so `R_ESC` stays zero.
 
 ## Observed results
 
 ```
-PoC A (one-shot instr_err_i fault)
-  BranchPredictor=1 + fault : R_HAN=00000013 R_ESC=00000101   <- escalated
-  BranchPredictor=0 + fault : R_HAN=00000001 R_ESC=00000000   <- correct
-  BranchPredictor=1, no fault: R_HAN=00000001 R_ESC=00000000  <- control
-
-PoC B (plain `ecall`, NO fault injection; repro.sh section B)
-  BranchPredictor=1         : R_HAN=00000013 R_ESC=00000101   <- escalated
-  BranchPredictor=0         : R_HAN=00000001 R_ESC=00000000   <- correct
+BranchPredictor=1 : R_HAN=00000013  R_ESC=00000101   <- escalated
+BranchPredictor=0 : R_HAN=00000001  R_ESC=00000000   <- correct
 ```
-
-PoC B differs from A only in what triggers the trap. `prog_u_ecall.S` runs in
-U-mode and executes an ordinary `ecall`; in the vulnerable build the trap handler
-is skipped and the `blt` back-edge, stranded in the skid buffer, is executed in
-M-mode:
-
-```
-RVFI 14 cyc=26 pc=000000b8 insn=00000073 trap=1 | priv=3 mcause=11  <- U-mode ecall, priv raised
-RVFI 15 cyc=29 pc=000000bc insn=ff24cce3 trap=0 | priv=3 mcause=11  <- the STALE blt
-RVFI 17 cyc=32 pc=000000c4 insn=305023f3 trap=0 | priv=3           <- csrr t2,mtvec SUCCEEDS
-```
-
-(`li t2, 0` sits between the branch and the probe so that the correct path,
-where the U-mode `csrr` traps and the handler skips it, still leaves
-`R_ESC = 0` rather than a stale register value.)
 
 * `R_HAN` (0x600) is written by the M-mode trap handler. `00000013` is the
-  memory fill pattern - i.e. the handler never ran.
+  memory fill pattern - the handler never ran.
 * `R_ESC` (0x604) is written by the U-mode code only if `csrr t2, mtvec`
-  succeeds, i.e. only if the core is in M-mode.
+  succeeds, i.e. only if the core is actually in M-mode.
 
-RVFI trace of the vulnerable run (`RVFI <n> cyc=.. pc=.. insn=.. trap=.. | priv=.. mcause=..`):
-
-```
-RVFI 14 cyc=26 pc=000000b8 insn=00000013 trap=1 | priv=3 mcause=1   <- access fault, priv raised to M
-RVFI 15 cyc=29 pc=000000bc insn=ff24cce3 trap=0 | priv=3 mcause=1   <- the STALE branch, still in M-mode
-RVFI 16 cyc=31 pc=000000c0 insn=305023f3 trap=0 | priv=3 mcause=1   <- csrr t2,mtvec SUCCEEDS (rd=0x101)
-```
-
-For comparison, the same instruction in genuine U-mode (`BranchPredictor=0`, or
-`BranchPredictor=1` without the fault) correctly traps:
+RVFI trace, vulnerable run
+(`RVFI <n> cyc=.. pc=.. insn=.. trap=.. | priv=.. mcause=..`):
 
 ```
-RVFI 22 cyc=38 pc=000000c0 insn=305023f3 trap=1 | priv=3 mcause=2   <- illegal instruction
+RVFI 14 cyc=26 pc=000000b8 insn=00000073 trap=1 | priv=3 mcause=8   <- U-mode ecall, priv raised to M
+RVFI 15 cyc=29 pc=000000bc insn=ff24cce3 trap=0 | priv=3 mcause=8   <- the STALE branch, still in M-mode
+RVFI 17 cyc=32 pc=000000c4 insn=305023f3 trap=0 | priv=3 mcause=8   <- csrr t2,mtvec SUCCEEDS (rd=0x101)
 ```
 
-The `no fault` control run is important: it shows the `csrr mtvec` probe really
-does trap when the core is honestly in U-mode, so `R_ESC = 0x101` can only be
-explained by the core running in M-mode.
+RVFI trace, correct run - the trap handler runs and the very same `csrr`
+correctly faults in U-mode:
+
+```
+RVFI 14 cyc=26 pc=000000b8 insn=00000073 trap=1 | priv=3 mcause=8   <- U-mode ecall, handler entered
+RVFI 15 cyc=29 pc=00000100 ...                                      <- handler at 0x100
+RVFI 20 cyc=34 pc=00000114 insn=30200073 trap=0 | priv=0            <- mret, back to U-mode
+RVFI 23 cyc=39 pc=000000c4 insn=305023f3 trap=1 | priv=3 mcause=2   <- illegal instruction
+```
+
+Because the handler runs in the correct build, the U-mode `csrr mtvec` probe
+genuinely traps there - so `R_ESC = 0x101` in the vulnerable build can only mean
+the core was executing with M-mode privilege.
 
 ## Suggested fix
 
@@ -204,54 +205,59 @@ explained by the core running in M-mode.
 
 `pc_set_i` is the PC-redirect signal already available in `ibex_if_stage`
 (`ibex_if_stage.sv:100`) and already used in `instr_skid_en`, so this simply
-makes the invalidation symmetric. It covers `PC_EXC` (exceptions), `PC_ERET`
-(`mret`), `PC_DRET` (`dret`) and `PC_JUMP`. It does not interfere with the
-predictor's own redirect, which goes through `pc_mux_internal == PC_BP` and does
-not assert `pc_set_i` (`ibex_if_stage.sv:237`).
+makes the invalidation symmetric: if the PC is redirected, the skid instruction
+is by definition on the wrong path and must be dropped. It covers `PC_EXC`
+(exceptions), `PC_ERET` (`mret`), `PC_DRET` (`dret`) and `PC_JUMP`, and does not
+interfere with the predictor's own redirect, which goes through
+`pc_mux_internal == PC_BP` and does not assert `pc_set_i`
+(`ibex_if_stage.sv:237`).
 
-Narrowing it to `pc_set_i & (pc_mux_i == PC_EXC)` (i.e. reusing the existing
-`flush_expanded`) also fixes the exception cases but leaves `mret` / `dret`
-broken.
+Narrowing the term to `pc_set_i & (pc_mux_i == PC_EXC)` (i.e. reusing the
+existing `flush_expanded`) also fixes the exception cases but leaves `mret` /
+`dret` broken.
 
-With the patch applied, all three cases in `repro.sh` produce `R_HAN=00000001`,
-`R_ESC=00000000`, and no regression was observed in the mult/div interrupt
-sweeps in the parent directory.
+With the patch applied every case covered by `repro.sh` produces
+`R_HAN=00000001`, `R_ESC=00000000`, and no regression was seen in the mult/div
+interrupt sweeps in the parent directory.
 
-## Reachability without any fault injection
+## Scope of the trigger
 
-`instr_err_i` is not a special "attacker only" signal. In `ibex_if_stage.sv:430`
-it is OR'd with the PMP and CHERIoT checks to form the single
-`instr_fetch_err` that reaches the controller:
+Anything that reaches the controller's `FLUSH` state is exposed: every
+synchronous exception (illegal instruction, `ecall`, `ebreak`, instruction fetch
+error, load/store misaligned or access fault, CHERIoT faults) plus `mret`,
+`dret`, `wfi` and CSR-write-triggered flushes.
+
+For the fetch-error family specifically, `instr_err_i` is not the only source -
+`ibex_if_stage.sv:430` ORs the PMP and CHERIoT checks into the same signal:
 
 ```systemverilog
 assign if_instr_err = if_instr_bus_err | if_instr_pmp_err | cheriot_acc_vio | cheriot_bound_vio;
 ```
 
-So the very same `FLUSH` window is reachable from entirely ordinary
-architecture:
+so a U-mode program jumping outside its executable region, or a CHERIoT fetch
+whose capability does not permit execution, reaches the identical window with no
+fault injection of any kind. The one requirement there is that the instruction
+after the faulting one is a loop back-edge (predicted taken) that does not itself
+produce a fetch error - `predict_branch_taken` is gated by `~fetch_err`
+(`ibex_if_stage.sv:780`).
 
-* **PMP instruction-access fault** - a U-mode program jumping outside its
-  executable region. This is precisely the violation a U-mode sandbox exists to
-  contain, and it needs no fault injection at all.
-* **CHERIoT fetch violation** (`cheriot_acc_vio` / `cheriot_bound_vio`) - a
-  capability whose bounds or permissions do not cover the fetch target.
-* A memory/interconnect error response, or an ECC error on a fetched word -
-  the error the ECC machinery is *designed* to trap on.
+External interrupts (`irq_*`) and debug requests (`debug_req_i`) are **not**
+affected; see the `FLUSH` versus `IRQ_TAKEN` note under Root cause.
 
-More generally the bug does not need `instr_err` at all: the same skid window is
-entered by every path through the controller's `FLUSH` state. It has been
-reproduced with an ordinary `ecall` (mcause 11) and with an ordinary `mret`, both
-of which are plain instructions requiring no fault injection. The `instr_err`
-variant exists only because it makes the trigger unambiguously external.
+## Alternative trigger: an external error response
 
-## Notes on the threat model
+The same window is reachable by perturbing one top-level port instead of using
+software - a single transient error response on `instr_err_i`, as a faulty
+memory or ECC error would produce. `prog_u.S` is the same program with the
+`ecall` replaced by a fetch that gets one injected error
+(`+fault_addr=<addr>`, one-shot):
 
-* The trigger is a **single, transient, external** error response on
-  `instr_err_i`. The same works through `data_err_i` (load/store access fault).
-  An attacker who can glitch the bus, corrupt a fetch, or use a malicious
-  peripheral needs no software cooperation.
-* The only code-shape requirement is that the instruction after the faulting one
-  is a backward branch (predicted taken). Loop back-edges are pervasive, so
-  this is not a contrived pattern.
-* External interrupts and debug requests do **not** trigger this; see the
-  `FLUSH` vs `IRQ_TAKEN` note above.
+```sh
+# +fault_addr takes a decimal address; extract it from the ELF
+F=$(riscv64-unknown-elf-nm prog_u.elf | awk '$3=="fault"{print $1}')
+./sim_bp +mem=prog_u.hex +fault_addr=$((16#$F)) +trace=1
+```
+
+This variant is only useful as a demonstration that the window is reachable from
+outside the core as well; the software path above needs no assistance from the
+environment at all, so it is the one to concentrate on.
